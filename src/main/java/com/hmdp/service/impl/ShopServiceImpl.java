@@ -46,20 +46,24 @@ private CacheClient cacheClient;
 
     @Override
     public Result queryById(Long id) {
-        //缓存穿透
-//      Shop shop = cacheClient.queryWithPassThrough(CACHE_SHOP_KEY,id,Shop.class,this::getById,CACHE_SHOP_TTL,TimeUnit.MINUTES);
-        //互斥锁解决缓存击穿
+        // 先尝试逻辑过期方案
+        Shop shop = cacheClient.queryWithLogicalExpire(
+                CACHE_SHOP_KEY, id, Shop.class,
+                this::getById, CACHE_SHOP_TTL, TimeUnit.MINUTES
+        );
 
-
-        //逻辑过期解决缓存击穿
-     Shop shop =
-               cacheClient.queryWithLogicalExpire(CACHE_SHOP_KEY, id, Shop.class, this::getById, CACHE_SHOP_TTL, TimeUnit.SECONDS);
+        // 如果逻辑过期方案未命中（数据未预热）， fallback到缓存穿透方案
+        if (shop == null) {
+            shop = cacheClient.queryWithPassThrough(
+                    CACHE_SHOP_KEY, id, Shop.class,
+                    this::getById, CACHE_SHOP_TTL, TimeUnit.MINUTES
+            );
+        }
 
         if (shop == null) {
             return Result.fail("店铺不存在");
         }
-        //返回
-     return Result.ok(shop);
+        return Result.ok(shop);
     }
 
     @Transactional
