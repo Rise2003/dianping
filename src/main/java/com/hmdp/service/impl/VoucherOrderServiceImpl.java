@@ -24,189 +24,179 @@ import javax.annotation.Resource;
 import java.util.Collections;
 import java.util.concurrent.*;
 
-/**
- * <p>
- *  服务实现类
- * </p>
- *
- * @author 虎哥
- * @since 2021-12-22
- */
 @Slf4j
 @Service
 public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, VoucherOrder> implements IVoucherOrderService {
-@Resource
-private ISeckillVoucherService seckillVoucherService;
-@Resource
-private RedisIdWorker redisIdWorker;
-@Resource
-private StringRedisTemplate stringRedisTemplate;
-@Resource
-private RedissonClient redissonClient;
 
-   /*
-    @Override
-    public Result seckillVoucher(Long voucherId) {
-        //1.查询优惠券
-        SeckillVoucher vocher = seckillVoucherService.getById(voucherId);
-        //2.判断秒杀是否开始
-        if (vocher.getBeginTime().isAfter(LocalDateTime.now())) {
-            //没开始
-            return Result.fail("秒杀未开始");
-        }
-        //3.判断秒杀是否已将结束
-        if (vocher.getEndTime().isBefore(LocalDateTime.now())) {
-            return Result.fail("秒杀已结束");
-        }
-        //4.判断库存是否充足
-        if (vocher.getStock()<1) {
-            //库存不足
-            return Result.fail("库存不足");
-        }
+    @Resource
+    private ISeckillVoucherService seckillVoucherService;
+    @Resource
+    private RedisIdWorker redisIdWorker;
+    @Resource
+    private StringRedisTemplate stringRedisTemplate;
+    @Resource
+    private RedissonClient redissonClient;
 
-        Long uId = UserHolder.getUser().getId();
-        //创建锁对象
-        RLock lock = redissonClient.getLock("lock:order:" + uId);
-        //获取锁
-        boolean isLock = lock.tryLock();
-        //判断是否过去锁成功
-        if (!isLock) {
-            //获取失败
-            return Result.fail("不允许重复下单");
-        }
-
-        try {
-            //获取代理对象（事务）
-            IVoucherOrderService proxy = (IVoucherOrderService)AopContext.currentProxy();
-            return proxy.createVoucherOrder(voucherId);
-        } catch (IllegalStateException e) {
-            throw new RuntimeException(e);
-        } finally {
-            //释放锁lock.unlock();
-        }
-
-    }  */
-   //初始化脚本
-   private static  final DefaultRedisScript<Long> SECKILL_SCRIPT;
-    static { SECKILL_SCRIPT=new DefaultRedisScript<>();
+    // 初始化脚本
+    private static final DefaultRedisScript<Long> SECKILL_SCRIPT;
+    static {
+        SECKILL_SCRIPT = new DefaultRedisScript<>();
         SECKILL_SCRIPT.setLocation(new ClassPathResource("seckill.lua"));
         SECKILL_SCRIPT.setResultType(Long.class);
     }
 
-    private BlockingQueue<VoucherOrder> voucherTask=new ArrayBlockingQueue<>(1024 * 1024);
-    //开启线程池
-    private static final ExecutorService SECKILL_ORDER_EXECUTOR= Executors.newSingleThreadExecutor();
+    private BlockingQueue<VoucherOrder> voucherTask = new ArrayBlockingQueue<>(1024 * 1024);
 
-    @PostConstruct//当前类初始化完成后执行
+    // 开启线程池
+    private static final ExecutorService SECKILL_ORDER_EXECUTOR = Executors.newSingleThreadExecutor();
+
+    // 使用volatile确保线程可见性
+    private volatile IVoucherOrderService proxy;
+
+    @PostConstruct
     private void init() {
         SECKILL_ORDER_EXECUTOR.submit(new VoucherOrderHandler());
     }
-    //开启异步线程
-    private class VoucherOrderHandler implements Runnable{
+
+    // 开启异步线程
+    private class VoucherOrderHandler implements Runnable {
         @Override
         public void run() {
-        while (true) {
+            while (true) {
+                try {
+                    // 1.获取队列中的订单信息
+                    VoucherOrder voucherOrder = voucherTask.take();
+                    // 2.创建订单
+                    handleVoucherOrder(voucherOrder);
+                } catch (Exception e) {
+                    log.error("处理订单异常", e);
+                }
+            }
+        }
+
+        private void handleVoucherOrder(VoucherOrder voucherOrder) {
+            Long userId = voucherOrder.getUserId();
+            // 创建锁对象
+            RLock lock = redissonClient.getLock("lock:order:" + userId);
+
             try {
-                //1.获取队列中的订单信息
-                VoucherOrder voucherOrder = voucherTask.take();
-                //2.创建订单
-                handleVocherOrder(voucherOrder);
+                // 获取锁，设置超时时间防止死锁
+                boolean isLock = lock.tryLock(1, 10, TimeUnit.SECONDS);
+                if (!isLock) {
+                    log.error("获取锁失败，用户ID: {}", userId);
+                    return;
+                }
+
+                try {
+                    // 确保proxy不为null
+                    if (proxy == null) {
+                        log.error("代理对象未初始化");
+                        return;
+                    }
+                    // 使用代理对象调用事务方法
+                    proxy.createVoucherOrder(voucherOrder);
+                    log.info("订单创建成功，订单ID: {}", voucherOrder.getId());
+                } finally {
+                    // 释放锁
+                    if (lock.isHeldByCurrentThread()) {
+                        lock.unlock();
+                    }
+                }
             } catch (InterruptedException e) {
-                log.error("处理订单异常",e);
-            }
-        }
-        }
-
-        private void handleVocherOrder(VoucherOrder voucherOrder) {
-            Long uId = voucherOrder.getUserId();
-            //创建锁对象
-            RLock lock = redissonClient.getLock("lock:order:" + uId);
-            //获取锁
-            boolean isLock = lock.tryLock();
-            //判断是否过去锁成功
-            if (!isLock) {
-                //获取失败
-                log.error("不允许重复下单");
-                return;
-            }
-
-            try {
-              proxy.createVoucherOrder(voucherOrder);
-
-            } catch (IllegalStateException e) {
-                throw new RuntimeException(e);
-            } finally {
-                //释放锁lock.unlock();
+                log.error("获取锁被中断", e);
+                Thread.currentThread().interrupt();
+            } catch (Exception e) {
+                log.error("处理订单异常，订单ID: {}", voucherOrder.getId(), e);
             }
         }
     }
-
-    private IVoucherOrderService proxy;
 
     @Override
     public Result seckillVoucher(Long voucherId) {
-       //获取用户
-        UserDTO userId = UserHolder.getUser();
-        //1.执行lua脚本
-        Long result = stringRedisTemplate.execute(SECKILL_SCRIPT,
-                Collections.emptyList(),
-                voucherId.toString(), userId.toString()
-        );
-        int r = result.intValue();
-        //2判断结果不为0，没购买资格
-        if (result != 0) {
-            return Result.fail(r==1?"库存不足":"不能重复下单");
+        // 获取用户
+        UserDTO user = UserHolder.getUser();
+        if (user == null) {
+            return Result.fail("用户未登录");
         }
 
-        //2.1判断结果为0，保存下单信息
-        //拿订单序列号
+        // 1.执行lua脚本
+        Long result = stringRedisTemplate.execute(
+                SECKILL_SCRIPT,
+                Collections.emptyList(),
+                voucherId.toString(),
+                user.getId().toString()
+        );
+
+        if (result == null) {
+            return Result.fail("秒杀失败");
+        }
+
+        int r = result.intValue();
+        // 2.判断结果不为0，没购买资格
+        if (r != 0) {
+            return Result.fail(r == 1 ? "库存不足" : "不能重复下单");
+        }
+
+        // 3.创建订单对象
         VoucherOrder voucherOrder = new VoucherOrder();
-        //2.2订单id
-        long orderId = redisIdWorker.nextId("order");
-        voucherOrder.setId(orderId);
-        //2.3用户id
-        Long uId = UserHolder.getUser().getId();
-        voucherOrder.setUserId(uId);
-        //2.4代金券id
+        voucherOrder.setId(redisIdWorker.nextId("order"));
+        voucherOrder.setUserId(user.getId());
         voucherOrder.setVoucherId(voucherId);
 
-        //3.创建堵塞队列
-        voucherTask.add(voucherOrder);
+        // 4.添加到阻塞队列
+        try {
+            voucherTask.put(voucherOrder);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return Result.fail("系统繁忙，请重试");
+        }
 
-        //4.获取代理对象（事务）
-        proxy = (IVoucherOrderService)AopContext.currentProxy();
+        // 5.获取代理对象（必须在主线程中获取）
+        if (proxy == null) {
+            synchronized (this) {
+                if (proxy == null) {
+                    proxy = (IVoucherOrderService) AopContext.currentProxy();
+                }
+            }
+        }
 
-        //5.返回订单id
-        return Result.ok(orderId);
-
+        // 6.返回订单id
+        return Result.ok(voucherOrder.getId());
     }
-
 
     @Transactional
     public void createVoucherOrder(VoucherOrder voucherOrder) {
-        //一人一单
-        Long uId = voucherOrder.getUserId();
+        Long userId = voucherOrder.getUserId();
+        Long voucherId = voucherOrder.getVoucherId();
 
-
-        //        查询订单
-            Integer count = query().eq("user_id", uId).eq("voucher_id", voucherOrder.getVoucherId()).count();
-            if (count > 0) {
-                //用户已经下过单
-                log.error("用户已经下过单");
-                return;
-            }
-
-            //5.扣减库存
-            boolean success = seckillVoucherService.update().setSql("stock=stock - 1")
-                    .eq("voucher_id", voucherOrder.getVoucherId()).gt("stock", 0)
-                    .update();
-
-            if (!success) {
-                log.error("库存不足");
-                return;
-            }
-
-            //6.创建订单
-
+        // 1.一人一单检查
+        Integer count = query().eq("user_id", userId)
+                .eq("voucher_id", voucherId)
+                .count();
+        if (count > 0) {
+            log.error("用户已经下过单，用户ID: {}, 优惠券ID: {}", userId, voucherId);
+            return;
         }
+
+        // 2.扣减库存
+        boolean success = seckillVoucherService.update()
+                .setSql("stock = stock - 1")
+                .eq("voucher_id", voucherId)
+                .gt("stock", 0)
+                .update();
+
+        if (!success) {
+            log.error("库存不足，优惠券ID: {}", voucherId);
+            return;
+        }
+
+        // 3.保存订单
+        boolean saveSuccess = save(voucherOrder);
+        if (!saveSuccess) {
+            log.error("保存订单失败，订单ID: {}", voucherOrder.getId());
+            // 可以在这里考虑回滚库存
+        } else {
+            log.info("订单保存成功，订单ID: {}", voucherOrder.getId());
+        }
+    }
 }
