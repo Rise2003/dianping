@@ -10,7 +10,7 @@ import org.springframework.boot.test.context.SpringBootTest;
 import javax.annotation.Resource;
 import java.util.concurrent.TimeUnit;
 
-@SpringBootTest
+//@SpringBootTest
 @Slf4j
 public class RedissonTest {
     @Resource
